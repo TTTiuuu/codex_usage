@@ -52,27 +52,19 @@ if [ ! -f "$READY_SCRIPT" ]; then
   exit 1
 fi
 
-# 如果旧 watcher 还在，先杀掉
-if [ -f "$WATCH_PID" ]; then
-  OLD_WATCH_PID="$(cat "$WATCH_PID" || true)"
-  if [ -n "${OLD_WATCH_PID:-}" ] && kill -0 "$OLD_WATCH_PID" 2>/dev/null; then
-    echo "Stopping old watcher pid: $OLD_WATCH_PID"
-    kill "$OLD_WATCH_PID" 2>/dev/null || true
-    sleep 1
-  fi
-  rm -f "$WATCH_PID"
-fi
+# 强制杀掉所有旧 watcher 和 UI 进程（包括不同目录的旧版本）
+for OLD_PID in $(pgrep -f "codex_tmux_status_watch.py" 2>/dev/null || true); do
+  echo "Killing old watcher pid: $OLD_PID"
+  kill "$OLD_PID" 2>/dev/null || true
+done
+for OLD_PID in $(pgrep -f "codex_float_ui.py" 2>/dev/null || true); do
+  echo "Killing old UI pid: $OLD_PID"
+  kill "$OLD_PID" 2>/dev/null || true
+done
+sleep 1
 
-# 如果旧 UI 还在，先杀掉
-if [ -f "$UI_PID" ]; then
-  OLD_UI_PID="$(cat "$UI_PID" || true)"
-  if [ -n "${OLD_UI_PID:-}" ] && kill -0 "$OLD_UI_PID" 2>/dev/null; then
-    echo "Stopping old UI pid: $OLD_UI_PID"
-    kill "$OLD_UI_PID" 2>/dev/null || true
-    sleep 1
-  fi
-  rm -f "$UI_PID"
-fi
+# 清理 PID 文件和旧 JSON
+rm -f "$WATCH_PID" "$UI_PID" "$JSON_PATH"
 
 # 清理旧 JSON，避免 UI 读到旧数据
 rm -f "$JSON_PATH"

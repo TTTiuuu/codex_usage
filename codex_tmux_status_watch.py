@@ -170,6 +170,8 @@ def parse_status(text: str) -> dict:
     - 5h reset time
     - weekly left percent
     - weekly reset time
+    - spark weekly left percent
+    - spark weekly reset time
     """
     result = {
         "model": "",
@@ -178,6 +180,8 @@ def parse_status(text: str) -> dict:
         "limit_5h_reset": "",
         "weekly_left_percent": None,
         "weekly_reset": "",
+        "spark_weekly_left_percent": None,
+        "spark_weekly_reset": "",
     }
 
     clean = strip_ansi(text)
@@ -185,18 +189,29 @@ def parse_status(text: str) -> dict:
     lines = [clean_line(ln) for ln in raw_lines]
     lines = [ln for ln in lines if ln]
 
+    in_spark_section = False
+
     for i, ln in enumerate(lines):
         low = ln.lower()
 
         if low.startswith("model:"):
             result["model"] = ln.split(":", 1)[1].strip()
+            in_spark_section = False
             continue
 
         if low.startswith("account:"):
             result["account"] = ln.split(":", 1)[1].strip()
+            in_spark_section = False
             continue
 
+        if "codex-spark" in low or ("gpt-5" in low and "spark" in low):
+            in_spark_section = True
+            # 不 continue — 这行本身可能就包含了额度数据
+
         if low.startswith("5h limit:"):
+            if in_spark_section:
+                # Spark 5h limit — skip, we only need spark weekly
+                continue
             if result["limit_5h_left_percent"] is not None:
                 continue
 
@@ -215,24 +230,32 @@ def parse_status(text: str) -> dict:
                         result["limit_5h_reset"] = m2.group(1).strip()
             continue
 
-        if low.startswith("weekly limit:"):
-            if result["weekly_left_percent"] is not None:
-                continue
+        if "weekly limit:" in low:
+            if in_spark_section:
+                if result["spark_weekly_left_percent"] is not None:
+                    continue
+                target_left = "spark_weekly_left_percent"
+                target_reset = "spark_weekly_reset"
+            else:
+                if result["weekly_left_percent"] is not None:
+                    continue
+                target_left = "weekly_left_percent"
+                target_reset = "weekly_reset"
 
             m = re.search(r"(\d+)%\s+left", ln, re.IGNORECASE)
             if m:
-                result["weekly_left_percent"] = int(m.group(1))
+                result[target_left] = int(m.group(1))
 
             # reset 可能在同一行，也可能在下一行
             m = re.search(r"resets\s+([^)│]+)", ln, re.IGNORECASE)
             if m:
-                result["weekly_reset"] = m.group(1).strip()
+                result[target_reset] = m.group(1).strip()
             else:
                 if i + 1 < len(lines):
                     next_ln = lines[i + 1]
                     m2 = re.search(r"resets\s+([^)│]+)", next_ln, re.IGNORECASE)
                     if m2:
-                        result["weekly_reset"] = m2.group(1).strip()
+                        result[target_reset] = m2.group(1).strip()
             continue
 
     return result
@@ -242,16 +265,20 @@ def format_compact(status: dict, ts: str, workdir: str = "") -> str:
     model = status.get("model") or "N/A"
     account = status.get("account") or "N/A"
 
-    h5_left = status.get("limit_5h_left_percent")
-    h5_reset = status.get("limit_5h_reset") or "N/A"
-
     weekly_left = status.get("weekly_left_percent")
     weekly_reset = status.get("weekly_reset") or "N/A"
 
-    h5_text = f"{h5_left}% left, resets {h5_reset}" if h5_left is not None else "N/A"
+    spark_weekly_left = status.get("spark_weekly_left_percent")
+    spark_weekly_reset = status.get("spark_weekly_reset") or "N/A"
+
     weekly_text = (
         f"{weekly_left}% left, resets {weekly_reset}"
         if weekly_left is not None
+        else "N/A"
+    )
+    spark_weekly_text = (
+        f"{spark_weekly_left}% left, resets {spark_weekly_reset}"
+        if spark_weekly_left is not None
         else "N/A"
     )
 
@@ -260,8 +287,8 @@ def format_compact(status: dict, ts: str, workdir: str = "") -> str:
         f"Time   : {ts}",
         f"Model  : {model}",
         f"Account: {account}",
-        f"5H     : {h5_text}",
-        f"Weekly : {weekly_text}",
+        f"7days  : {weekly_text}",
+        f"5.3Spark : {spark_weekly_text}",
     ]
 
     if workdir:

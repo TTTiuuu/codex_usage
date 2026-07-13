@@ -52,6 +52,16 @@ class TimeRemainingPercentTest(unittest.TestCase):
 
         self.assertEqual(format_reset_text("h5", "13:43", now), "13:43")
 
+    def test_spark_reset_shows_month_day_when_not_today(self):
+        now = datetime(2026, 7, 2, 8, 0, 0)
+
+        self.assertEqual(format_reset_text("spark", "10:53 on 7 Jul", now), "7.7")
+
+    def test_spark_reset_shows_time_when_today(self):
+        now = datetime(2026, 7, 7, 8, 0, 0)
+
+        self.assertEqual(format_reset_text("spark", "10:53 on 7 Jul", now), "10:53")
+
     def test_status_is_stale_after_more_than_three_minutes(self):
         now = datetime(2026, 7, 2, 8, 4, 1)
 
