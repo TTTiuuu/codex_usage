@@ -1,7 +1,13 @@
 import unittest
 from datetime import datetime
 
-from codex_float_ui import format_reset_text, status_is_stale, time_remaining_percent
+from codex_float_ui import (
+    format_reset_text,
+    quota_row_is_available,
+    snap_position,
+    status_is_stale,
+    time_remaining_percent,
+)
 
 
 class TimeRemainingPercentTest(unittest.TestCase):
@@ -60,6 +66,36 @@ class TimeRemainingPercentTest(unittest.TestCase):
         now = datetime(2026, 7, 2, 8, 4, 0)
 
         self.assertTrue(status_is_stale("bad timestamp", now))
+
+    def test_quota_row_is_hidden_when_left_percent_is_missing(self):
+        self.assertFalse(quota_row_is_available(None))
+
+    def test_quota_row_is_visible_when_left_percent_is_zero(self):
+        self.assertTrue(quota_row_is_available(0))
+
+    def test_snap_position_snaps_to_top_edge(self):
+        self.assertEqual(
+            snap_position(120, 10, 200, 80, 1000, 800, 24),
+            (120, 0),
+        )
+
+    def test_snap_position_snaps_to_right_edge(self):
+        self.assertEqual(
+            snap_position(785, 120, 200, 80, 1000, 800, 24),
+            (800, 120),
+        )
+
+    def test_snap_position_keeps_position_outside_threshold(self):
+        self.assertEqual(
+            snap_position(120, 40, 200, 80, 1000, 800, 24),
+            (120, 40),
+        )
+
+    def test_snap_position_can_ignore_top_edge_when_dragging_away(self):
+        self.assertEqual(
+            snap_position(120, 10, 200, 80, 1000, 800, 24, ignored_edges={"top"}),
+            (120, 10),
+        )
 
 
 if __name__ == "__main__":

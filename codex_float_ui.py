@@ -9,9 +9,10 @@ from datetime import datetime, timedelta
 JSON_PATH = "/tmp/codex_status.json"
 REFRESH_MS = 5000
 
-BAR_WIDTH = 155
+BAR_WIDTH = 310
 BAR_HEIGHT = 8
 TIME_BAR_HEIGHT = 3
+SNAP_DISTANCE = 24
 H5_WINDOW_MINUTES = 5 * 60
 WEEKLY_WINDOW_MINUTES = 7 * 24 * 60
 TIME_WINDOWS = {
@@ -142,6 +143,39 @@ def status_is_stale(timestamp: str, now: datetime | None = None) -> bool:
     return (now - updated_at) > timedelta(minutes=3)
 
 
+def quota_row_is_available(left_percent) -> bool:
+    return left_percent is not None
+
+
+def snap_position(
+    x: int,
+    y: int,
+    window_width: int,
+    window_height: int,
+    screen_width: int,
+    screen_height: int,
+    snap_distance: int = SNAP_DISTANCE,
+    ignored_edges: set[str] | None = None,
+):
+    if ignored_edges is None:
+        ignored_edges = set()
+
+    max_x = max(0, screen_width - window_width)
+    max_y = max(0, screen_height - window_height)
+
+    if "left" not in ignored_edges and abs(x) <= snap_distance:
+        x = 0
+    elif "right" not in ignored_edges and abs(max_x - x) <= snap_distance:
+        x = max_x
+
+    if "top" not in ignored_edges and abs(y) <= snap_distance:
+        y = 0
+    elif "bottom" not in ignored_edges and abs(max_y - y) <= snap_distance:
+        y = max_y
+
+    return x, y
+
+
 class CodexFloatingUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -154,6 +188,8 @@ class CodexFloatingUI:
 
         self.drag_x = 0
         self.drag_y = 0
+        self.drag_start_x = 0
+        self.drag_start_y = 0
 
         self.build_ui()
         self.position_window()
@@ -179,7 +215,7 @@ class CodexFloatingUI:
             self.root,
             bg="#111111",
             padx=11,
-            pady=8,
+            pady=5,
             highlightthickness=1,
             highlightbackground="#2c2c2c",
         )
@@ -190,7 +226,7 @@ class CodexFloatingUI:
 
     def build_section(self, name, attr_prefix):
         container = tk.Frame(self.frame, bg="#111111")
-        container.pack(fill="x", pady=(0, 4))
+        container.pack(fill="x", pady=(0, 2))
 
         label = tk.Label(
             container,
@@ -204,7 +240,7 @@ class CodexFloatingUI:
         label.pack(side="left", padx=(0, 4))
 
         bar_group = tk.Frame(container, bg="#111111")
-        bar_group.pack(side="left", padx=(0, 4), pady=(2, 0))
+        bar_group.pack(side="left", padx=(0, 4), pady=(1, 0))
 
         bar_canvas = tk.Canvas(
             bar_group,
@@ -254,12 +290,23 @@ class CodexFloatingUI:
         setattr(self, f"{attr_prefix}_time_bar", time_bar_canvas)
         setattr(self, f"{attr_prefix}_reset", reset)
 
+    def set_section_visible(self, prefix, visible):
+        container = getattr(self, f"{prefix}_container")
+        is_mapped = bool(container.winfo_ismapped())
+
+        if visible and not is_mapped:
+            before = getattr(self, "weekly_container", None) if prefix == "h5" else None
+            container.pack(fill="x", pady=(0, 2), before=before)
+        elif not visible and is_mapped:
+            container.pack_forget()
+
     def bind_drag_events(self):
         self.bind_drag_recursive(self.frame)
 
     def bind_drag_recursive(self, widget):
         widget.bind("<ButtonPress-1>", self.start_drag)
         widget.bind("<B1-Motion>", self.drag)
+        widget.bind("<ButtonRelease-1>", self.end_drag)
 
         for child in widget.winfo_children():
             self.bind_drag_recursive(child)
@@ -267,10 +314,39 @@ class CodexFloatingUI:
     def start_drag(self, event):
         self.drag_x = self.root.winfo_pointerx() - self.root.winfo_x()
         self.drag_y = self.root.winfo_pointery() - self.root.winfo_y()
+        self.drag_start_x = self.root.winfo_x()
+        self.drag_start_y = self.root.winfo_y()
 
     def drag(self, event):
         x = self.root.winfo_pointerx() - self.drag_x
         y = self.root.winfo_pointery() - self.drag_y
+        self.root.geometry(f"+{x}+{y}")
+
+    def end_drag(self, event):
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        max_x = max(0, self.root.winfo_screenwidth() - self.root.winfo_width())
+        max_y = max(0, self.root.winfo_screenheight() - self.root.winfo_height())
+        ignored_edges = set()
+
+        if abs(self.drag_start_x) <= SNAP_DISTANCE and x > self.drag_start_x:
+            ignored_edges.add("left")
+        if abs(max_x - self.drag_start_x) <= SNAP_DISTANCE and x < self.drag_start_x:
+            ignored_edges.add("right")
+        if abs(self.drag_start_y) <= SNAP_DISTANCE and y > self.drag_start_y:
+            ignored_edges.add("top")
+        if abs(max_y - self.drag_start_y) <= SNAP_DISTANCE and y < self.drag_start_y:
+            ignored_edges.add("bottom")
+
+        x, y = snap_position(
+            x,
+            y,
+            self.root.winfo_width(),
+            self.root.winfo_height(),
+            self.root.winfo_screenwidth(),
+            self.root.winfo_screenheight(),
+            ignored_edges=ignored_edges,
+        )
         self.root.geometry(f"+{x}+{y}")
 
     def read_status(self):
@@ -441,11 +517,16 @@ class CodexFloatingUI:
         data, error = self.read_status()
 
         if error:
+            self.set_section_visible("h5", True)
+            self.set_section_visible("weekly", True)
             self.update_section("h5", None, "N/A", stale=True)
             self.update_section("weekly", None, "N/A", stale=True)
         else:
             stale = status_is_stale(data["timestamp"])
-            self.update_section("h5", data["h5_left"], data["h5_reset"], stale=stale)
+            show_h5 = quota_row_is_available(data["h5_left"])
+            self.set_section_visible("h5", show_h5)
+            if show_h5:
+                self.update_section("h5", data["h5_left"], data["h5_reset"], stale=stale)
             self.update_section(
                 "weekly",
                 data["weekly_left"],
