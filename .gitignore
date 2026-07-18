@@ -1,2 +1,5 @@
 __pycache__/
 .mimocode/
+.pytest_cache/
+.coverage
+*.pyc

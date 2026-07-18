@@ -11,18 +11,25 @@ from datetime import datetime
 
 
 DEFAULT_SESSION = "codex_quota_watch"
+SESSION_MANAGED_OPTION = "@codex_usage_managed"
+SESSION_WORKDIR_OPTION = "@codex_usage_workdir"
+SESSION_COMMAND_OPTION = "@codex_usage_command"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def run(cmd, check=True):
-    return subprocess.run(
+    result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        check=check,
+        check=False,
     )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+        raise RuntimeError(f"{cmd[0]} failed ({result.returncode}): {detail}")
+    return result
 
 
 def require_cmd(cmd: str):
@@ -49,24 +56,54 @@ def tmux_session_exists(session: str) -> bool:
     return r.returncode == 0
 
 
+def tmux_get_option(session: str, option: str) -> str:
+    result = run(
+        ["tmux", "show-options", "-v", "-t", session, option],
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def tmux_set_option(session: str, option: str, value: str):
+    run(["tmux", "set-option", "-t", session, option, value])
+
+
 def start_codex_session(session: str, workdir: str, codex_cmd: str) -> bool:
     """
     返回 True 表示新建了 tmux session。
     返回 False 表示复用了已有 tmux session。
     """
-    if tmux_session_exists(session):
-        return False
-
     if not os.path.isdir(workdir):
         raise RuntimeError(f"目录不存在：{workdir}")
 
     require_cmd("tmux")
     require_cmd(codex_cmd)
 
+    if tmux_session_exists(session):
+        managed = tmux_get_option(session, SESSION_MANAGED_OPTION)
+        existing_workdir = tmux_get_option(session, SESSION_WORKDIR_OPTION)
+        existing_command = tmux_get_option(session, SESSION_COMMAND_OPTION)
+
+        if managed != "1":
+            raise RuntimeError(
+                f"tmux 会话 {session!r} 已存在，但不是本工具创建的；"
+                "为避免干扰现有会话，拒绝复用"
+            )
+        if existing_workdir != workdir or existing_command != codex_cmd:
+            raise RuntimeError(
+                f"tmux 会话 {session!r} 的参数不匹配："
+                f"workdir={existing_workdir!r}, command={existing_command!r}"
+            )
+        return False
+
     run([
         "tmux",
         "new-session",
         "-d",
+        "-x",
+        "200",
+        "-y",
+        "50",
         "-s",
         session,
         "-c",
@@ -74,18 +111,20 @@ def start_codex_session(session: str, workdir: str, codex_cmd: str) -> bool:
         codex_cmd,
     ])
 
+    tmux_set_option(session, SESSION_MANAGED_OPTION, "1")
+    tmux_set_option(session, SESSION_WORKDIR_OPTION, workdir)
+    tmux_set_option(session, SESSION_COMMAND_OPTION, codex_cmd)
+
     time.sleep(3)
     return True
 
 
 def tmux_send_key(session: str, key: str):
-    run(["tmux", "send-keys", "-t", session, key], check=False)
+    run(["tmux", "send-keys", "-t", session, key])
 
 
-def tmux_send_text_slow(session: str, text: str, char_delay: float = 0.03):
-    for ch in text:
-        run(["tmux", "send-keys", "-t", session, ch], check=False)
-        time.sleep(char_delay)
+def tmux_send_text(session: str, text: str):
+    run(["tmux", "send-keys", "-t", session, "-l", text])
 
 
 def clear_tmux_pane(session: str):
@@ -94,7 +133,7 @@ def clear_tmux_pane(session: str):
     """
     tmux_send_key(session, "C-l")
     time.sleep(0.1)
-    run(["tmux", "clear-history", "-t", session], check=False)
+    run(["tmux", "clear-history", "-t", session])
     time.sleep(0.1)
 
 
@@ -106,7 +145,7 @@ def send_status(session: str, double_enter: bool = True):
     tmux_send_key(session, "C-u")
     time.sleep(0.1)
 
-    tmux_send_text_slow(session, "/status")
+    tmux_send_text(session, "/status")
     time.sleep(0.1)
 
     tmux_send_key(session, "Enter")
@@ -123,9 +162,10 @@ def capture_pane(session: str, lines: int = 120) -> str:
         "-t",
         session,
         "-p",
+        "-J",
         "-S",
         f"-{lines}",
-    ], check=False)
+    ])
 
     return strip_ansi(r.stdout)
 
@@ -204,7 +244,8 @@ def parse_status(text: str) -> dict:
             in_spark_section = False
             continue
 
-        if "codex-spark" in low or ("gpt-5" in low and "spark" in low):
+        line_is_spark = "codex-spark" in low or ("gpt-5" in low and "spark" in low)
+        if line_is_spark:
             in_spark_section = True
             # 不 continue — 这行本身可能就包含了额度数据
 
@@ -217,7 +258,9 @@ def parse_status(text: str) -> dict:
 
             m = re.search(r"(\d+)%\s+left", ln, re.IGNORECASE)
             if m:
-                result["limit_5h_left_percent"] = int(m.group(1))
+                percent = int(m.group(1))
+                if 0 <= percent <= 100:
+                    result["limit_5h_left_percent"] = percent
 
             m = re.search(r"resets\s+([^)│]+)", ln, re.IGNORECASE)
             if m:
@@ -244,7 +287,9 @@ def parse_status(text: str) -> dict:
 
             m = re.search(r"(\d+)%\s+left", ln, re.IGNORECASE)
             if m:
-                result[target_left] = int(m.group(1))
+                percent = int(m.group(1))
+                if 0 <= percent <= 100:
+                    result[target_left] = percent
 
             # reset 可能在同一行，也可能在下一行
             m = re.search(r"resets\s+([^)│]+)", ln, re.IGNORECASE)
@@ -256,6 +301,10 @@ def parse_status(text: str) -> dict:
                     m2 = re.search(r"resets\s+([^)│]+)", next_ln, re.IGNORECASE)
                     if m2:
                         result[target_reset] = m2.group(1).strip()
+            if target_left == "spark_weekly_left_percent":
+                # Spark 周额度是该区块的最后一项；之后的普通额度不能继续
+                # 沿用 Spark 上下文。
+                in_spark_section = False
             continue
 
     return result
@@ -287,8 +336,8 @@ def format_compact(status: dict, ts: str, workdir: str = "") -> str:
         f"Time   : {ts}",
         f"Model  : {model}",
         f"Account: {account}",
-        f"7days  : {weekly_text}",
-        f"5.3Spark : {spark_weekly_text}",
+        f"Weekly: {weekly_text}",
+        f"Spark : {spark_weekly_text}",
     ]
 
     if workdir:
@@ -305,10 +354,72 @@ def write_json(path: str, payload: dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
+
+
+def status_has_displayable_quota(status: dict) -> bool:
+    return any(
+        status.get(key) is not None
+        for key in ("weekly_left_percent", "spark_weekly_left_percent")
+    )
+
+
+def read_json(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_error_status(
+    path: str,
+    error: str,
+    attempted_at: str,
+    workdir: str,
+    session: str,
+):
+    if not path:
+        return
+
+    previous = read_json(path)
+    payload = {
+        "timestamp": previous.get("timestamp", ""),
+        "last_success_at": previous.get(
+            "last_success_at", previous.get("timestamp", "")
+        ),
+        "attempted_at": attempted_at,
+        "error": error,
+        "workdir": workdir,
+        "session": session,
+        "status": previous.get("status") or parse_status(""),
+    }
+    write_json(path, payload)
+
+
+def ensure_session_ready(args, workdir: str) -> bool:
+    created = start_codex_session(args.session, workdir, args.cmd)
+    if not created:
+        return False
+
+    first_screen = capture_pane(args.session, args.lines)
+    if looks_like_trust_prompt(first_screen):
+        if args.auto_trust:
+            accept_trust_prompt(args.session)
+        else:
+            raise RuntimeError(
+                "检测到 Codex 目录信任提示。请先手动信任该目录，"
+                "或明确使用 --auto-trust"
+            )
+    return True
 
 
 def main():
@@ -402,33 +513,27 @@ def main():
     double_enter = not args.no_double_enter
 
     try:
-        created = start_codex_session(args.session, workdir, args.cmd)
+        ensure_session_ready(args, workdir)
     except Exception as e:
+        attempted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        write_error_status(
+            args.json_out,
+            str(e),
+            attempted_at,
+            workdir,
+            args.session,
+        )
         print(f"启动失败：{e}", file=sys.stderr)
         return 1
 
     if args.attach:
         os.execvp("tmux", ["tmux", "attach", "-t", args.session])
 
-    if created:
-        first_screen = capture_pane(args.session, args.lines)
-        if looks_like_trust_prompt(first_screen):
-            if args.auto_trust:
-                accept_trust_prompt(args.session)
-            else:
-                print("检测到 Codex trust 目录提示。")
-                print()
-                print("请先手动进入 tmux：")
-                print(f"  tmux attach -t {args.session}")
-                print()
-                print("选择 1 回车后，按 Ctrl+B 再按 D 断开。")
-                print("或者下次运行时加：--auto-trust")
-                return 2
-
     while True:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        attempted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
+            ensure_session_ready(args, workdir)
             clear_tmux_pane(args.session)
 
             send_status(args.session, double_enter=double_enter)
@@ -443,9 +548,18 @@ def main():
                 screen_text = capture_pane(args.session, args.lines)
 
             status = parse_status(screen_text)
+            if not status_has_displayable_quota(status):
+                raise RuntimeError(
+                    "未从 /status 输出中解析到 Weekly 或 Spark Weekly 额度"
+                )
+
+            succeeded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             payload = {
-                "timestamp": ts,
+                "timestamp": succeeded_at,
+                "last_success_at": succeeded_at,
+                "attempted_at": attempted_at,
+                "error": "",
                 "workdir": workdir,
                 "session": args.session,
                 "status": status,
@@ -459,15 +573,22 @@ def main():
             if args.raw:
                 print(screen_text.strip())
             else:
-                print(format_compact(status, ts, workdir))
+                print(format_compact(status, succeeded_at, workdir))
 
         except KeyboardInterrupt:
             raise
 
         except Exception as e:
+            write_error_status(
+                args.json_out,
+                str(e),
+                attempted_at,
+                workdir,
+                args.session,
+            )
             if not args.no_clear:
                 clear_screen()
-            print(f"[{ts}] 查询失败：{e}")
+            print(f"[{attempted_at}] 查询失败：{e}")
             print(f"可以查看真实 Codex 会话：tmux attach -t {args.session}")
 
         if args.single:

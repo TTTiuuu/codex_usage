@@ -14,8 +14,14 @@ def status_json_has_quota_values(path) -> bool:
     except Exception:
         return False
 
+    if data.get("error"):
+        return False
+
     status = data.get("status") or {}
-    return status.get("weekly_left_percent") is not None
+    return any(
+        status.get(key) is not None
+        for key in ("weekly_left_percent", "spark_weekly_left_percent")
+    )
 
 
 def main(argv):
