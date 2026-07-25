@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ SESSION_WORKDIR_OPTION = "@codex_usage_workdir"
 SESSION_COMMAND_OPTION = "@codex_usage_command"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+APP_SERVER_TIMEOUT_SECONDS = 20
 
 
 def run(cmd, check=True):
@@ -199,6 +201,173 @@ def clean_line(line: str) -> str:
 def status_needs_limit_refresh(text: str) -> bool:
     clean = strip_ansi(text).lower()
     return "limits:" in clean and "refresh requested" in clean
+
+
+def _weekly_window(snapshot: dict) -> dict:
+    windows = [
+        window
+        for key in ("primary", "secondary")
+        if isinstance((window := snapshot.get(key)), dict)
+    ]
+    if not windows:
+        return {}
+
+    # Pro accounts may expose a short primary window and a weekly secondary
+    # window. Other plans currently expose the weekly window as primary.
+    return max(
+        windows,
+        key=lambda window: window.get("windowDurationMins") or 0,
+    )
+
+
+def _reset_text(resets_at) -> str:
+    if not isinstance(resets_at, (int, float)):
+        return ""
+    return datetime.fromtimestamp(resets_at).strftime("%H:%M on %d %b")
+
+
+def parse_app_server_rate_limits(payload: dict) -> dict:
+    """
+    Convert account/rateLimits/read into the status shape consumed by the UI.
+    """
+    result = parse_status("")
+    by_limit_id = payload.get("rateLimitsByLimitId")
+    if not isinstance(by_limit_id, dict):
+        by_limit_id = {}
+
+    default_snapshot = payload.get("rateLimits")
+    if isinstance(default_snapshot, dict) and "codex" not in by_limit_id:
+        by_limit_id = {"codex": default_snapshot, **by_limit_id}
+
+    weekly_snapshot = None
+    spark_snapshot = None
+    for limit_id, snapshot in by_limit_id.items():
+        if not isinstance(snapshot, dict):
+            continue
+        limit_name = str(snapshot.get("limitName") or "")
+        identifier = f"{limit_id} {limit_name}".lower()
+        if "spark" in identifier or "bengalfox" in identifier:
+            spark_snapshot = snapshot
+        elif limit_id == "codex" or weekly_snapshot is None:
+            weekly_snapshot = snapshot
+
+    def apply_snapshot(snapshot, left_key, reset_key):
+        if not isinstance(snapshot, dict):
+            return
+        window = _weekly_window(snapshot)
+        used_percent = window.get("usedPercent")
+        if isinstance(used_percent, int) and 0 <= used_percent <= 100:
+            result[left_key] = 100 - used_percent
+        result[reset_key] = _reset_text(window.get("resetsAt"))
+
+    apply_snapshot(
+        weekly_snapshot,
+        "weekly_left_percent",
+        "weekly_reset",
+    )
+    apply_snapshot(
+        spark_snapshot,
+        "spark_weekly_left_percent",
+        "spark_weekly_reset",
+    )
+    return result
+
+
+def query_app_server_rate_limits(codex_cmd: str) -> dict:
+    """
+    Read quota data through Codex's local app-server protocol.
+
+    This avoids depending on TUI rendering and remains compatible with older
+    Codex versions because callers can fall back to /status screen parsing.
+    """
+    require_cmd(codex_cmd)
+    requests = "\n".join([
+        json.dumps({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codex-usage",
+                    "title": "Codex Usage",
+                    "version": "1.0.0",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        }),
+        json.dumps({
+            "id": 2,
+            "method": "account/rateLimits/read",
+            "params": None,
+        }),
+        "",
+    ])
+
+    process = subprocess.Popen(
+        [codex_cmd, "app-server", "--stdio"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    response = None
+    stderr_text = ""
+    deadline = time.monotonic() + APP_SERVER_TIMEOUT_SECONDS
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+
+    try:
+        process.stdin.write(requests)
+        process.stdin.flush()
+
+        while time.monotonic() < deadline:
+            remaining = max(0, deadline - time.monotonic())
+            events = selector.select(timeout=remaining)
+            if not events:
+                if process.poll() is not None:
+                    break
+                continue
+
+            line = process.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == 2:
+                response = message
+                break
+    finally:
+        selector.close()
+        if process.stdin is not None:
+            process.stdin.close()
+            process.stdin = None
+        if process.poll() is None:
+            process.terminate()
+        try:
+            _, stderr_text = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr_text = process.communicate()
+
+    if response is None and time.monotonic() >= deadline:
+        raise RuntimeError("Codex 本地额度接口查询超时")
+
+    if response is None:
+        detail = stderr_text.strip() or "未收到 rateLimits 响应"
+        raise RuntimeError(f"Codex 本地额度接口失败：{detail}")
+    if response.get("error"):
+        raise RuntimeError(f"Codex 本地额度接口失败：{response['error']}")
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Codex 本地额度接口返回了无效数据")
+
+    status = parse_app_server_rate_limits(result)
+    if not status_has_displayable_quota(status):
+        raise RuntimeError("Codex 本地额度接口未返回 Weekly 或 Spark 额度")
+    return status
 
 
 def parse_status(text: str) -> dict:
@@ -512,46 +681,42 @@ def main():
     workdir = os.path.abspath(os.path.expanduser(args.workdir))
     double_enter = not args.no_double_enter
 
-    try:
-        ensure_session_ready(args, workdir)
-    except Exception as e:
-        attempted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        write_error_status(
-            args.json_out,
-            str(e),
-            attempted_at,
-            workdir,
-            args.session,
-        )
-        print(f"启动失败：{e}", file=sys.stderr)
-        return 1
-
     if args.attach:
+        try:
+            ensure_session_ready(args, workdir)
+        except Exception as e:
+            print(f"启动失败：{e}", file=sys.stderr)
+            return 1
         os.execvp("tmux", ["tmux", "attach", "-t", args.session])
 
     while True:
         attempted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            ensure_session_ready(args, workdir)
-            clear_tmux_pane(args.session)
+            app_server_error = None
+            try:
+                status = query_app_server_rate_limits(args.cmd)
+            except Exception as e:
+                app_server_error = e
+                ensure_session_ready(args, workdir)
+                clear_tmux_pane(args.session)
 
-            send_status(args.session, double_enter=double_enter)
-            time.sleep(args.wait_after_status)
-
-            screen_text = capture_pane(args.session, args.lines)
-
-            if status_needs_limit_refresh(screen_text):
-                time.sleep(6)
                 send_status(args.session, double_enter=double_enter)
                 time.sleep(args.wait_after_status)
                 screen_text = capture_pane(args.session, args.lines)
 
-            status = parse_status(screen_text)
+                if status_needs_limit_refresh(screen_text):
+                    time.sleep(6)
+                    send_status(args.session, double_enter=double_enter)
+                    time.sleep(args.wait_after_status)
+                    screen_text = capture_pane(args.session, args.lines)
+
+                status = parse_status(screen_text)
             if not status_has_displayable_quota(status):
-                raise RuntimeError(
-                    "未从 /status 输出中解析到 Weekly 或 Spark Weekly 额度"
-                )
+                detail = "未从 /status 输出中解析到 Weekly 或 Spark Weekly 额度"
+                if app_server_error is not None:
+                    detail = f"{app_server_error}；{detail}"
+                raise RuntimeError(detail)
 
             succeeded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 

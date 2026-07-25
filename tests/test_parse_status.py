@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from codex_tmux_status_watch import (
+    parse_app_server_rate_limits,
     parse_status,
     status_has_displayable_quota,
     status_needs_limit_refresh,
@@ -13,6 +14,61 @@ from codex_tmux_status_watch import (
 
 
 class ParseStatusTest(unittest.TestCase):
+    def test_parses_app_server_weekly_and_spark_limits(self):
+        status = parse_app_server_rate_limits({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 46,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1785285226,
+                },
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 46,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1785285226,
+                    },
+                },
+                "codex_bengalfox": {
+                    "limitId": "codex_bengalfox",
+                    "limitName": "GPT-5.3-Codex-Spark",
+                    "primary": {
+                        "usedPercent": 0,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1785553275,
+                    },
+                },
+            },
+        })
+
+        self.assertEqual(status["weekly_left_percent"], 54)
+        self.assertEqual(status["spark_weekly_left_percent"], 100)
+        self.assertTrue(status["weekly_reset"])
+        self.assertTrue(status["spark_weekly_reset"])
+
+    def test_app_server_uses_longer_secondary_window_for_weekly(self):
+        status = parse_app_server_rate_limits({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 10,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1785000000,
+                },
+                "secondary": {
+                    "usedPercent": 46,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1785285226,
+                },
+            },
+        })
+
+        self.assertEqual(status["weekly_left_percent"], 54)
+
     def test_keeps_primary_limits_when_pro_status_includes_spark_limits(self):
         text = """
 │  Account:                     rareay.tan@gmail.com (Plus)                    │

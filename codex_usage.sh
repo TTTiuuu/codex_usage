@@ -233,7 +233,23 @@ start_impl() {
   watcher_pid=$!
   printf '%s\n' "$watcher_pid" > "$WATCH_PID"
 
-  for _ in $(seq 1 45); do
+  # Show the UI immediately. It can display the temporary unavailable state
+  # while Codex refreshes the quota data in the background.
+  nohup python3 -u "$UI_SCRIPT" > "$UI_LOG" 2>&1 9>&- &
+  ui_pid=$!
+  printf '%s\n' "$ui_pid" > "$UI_PID"
+  sleep 1
+
+  if ! process_matches "$ui_pid" "$UI_SCRIPT"; then
+    echo "ERROR: floating UI failed to start." >&2
+    tail -n 40 "$UI_LOG" >&2 || true
+    stop_impl
+    return 1
+  fi
+
+  # The watcher retries every 60 seconds. Allow enough time for a second
+  # /status query when Codex initially replies that limits are refreshing.
+  for _ in $(seq 1 90); do
     if python3 "$READY_SCRIPT" "$STATUS_PATH"; then
       ready=1
       break
@@ -249,22 +265,8 @@ start_impl() {
   done
 
   if [ "$ready" -ne 1 ]; then
-    echo "ERROR: quota data was not ready after 45 seconds." >&2
+    echo "WARNING: quota data is still refreshing after 90 seconds." >&2
     tail -n 40 "$WATCH_LOG" >&2 || true
-    stop_impl
-    return 1
-  fi
-
-  nohup python3 -u "$UI_SCRIPT" > "$UI_LOG" 2>&1 9>&- &
-  ui_pid=$!
-  printf '%s\n' "$ui_pid" > "$UI_PID"
-  sleep 1
-
-  if ! process_matches "$ui_pid" "$UI_SCRIPT"; then
-    echo "ERROR: floating UI failed to start." >&2
-    tail -n 40 "$UI_LOG" >&2 || true
-    stop_impl
-    return 1
   fi
 
   echo "Started successfully."

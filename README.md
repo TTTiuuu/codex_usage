@@ -47,6 +47,12 @@ sudo apt install -y tmux python3-tk util-linux
 
 ## 添加到应用菜单或开机启动
 
+在桌面创建可双击启动的快捷方式：
+
+```bash
+./install_desktop_launcher.sh --desktop
+```
+
 添加到桌面应用菜单：
 
 ```bash
