@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ICON_PATH="$SCRIPT_DIR/assets/codex-usage-monitor.svg"
 APPLICATIONS_DIR="${XDG_DATA_HOME:-${HOME:?HOME is not set}/.local/share}/applications"
 AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
@@ -51,7 +52,7 @@ for target in "${TARGETS[@]}"; do
     echo "Comment=Show Codex quota in a floating desktop window"
     printf 'Exec="%s/codex_usage.sh" start "%s"\n' "$SCRIPT_DIR" "$SCRIPT_DIR"
     printf 'Path=%s\n' "$SCRIPT_DIR"
-    echo "Icon=utilities-system-monitor"
+    printf 'Icon=%s\n' "$ICON_PATH"
     echo "Terminal=false"
     echo "Categories=Utility;"
     echo "StartupNotify=false"
